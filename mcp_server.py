@@ -263,8 +263,10 @@ def _format_forecast(city_display: str, daily: dict[str, Any], units: str) -> st
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
-#: User-Agent для запросов к Wikipedia (иначе API возвращает 403).
-WIKIPEDIA_HEADERS = {"User-Agent": "Week1Task19-MCP/0.1 (educational project)"}
+#: User-Agent для запросов к Wikipedia.
+#: Wikipedia требует описательный User-Agent с контактной информацией (иначе
+#: возвращает 403). При необходимости замените email на свой.
+WIKIPEDIA_HEADERS = {"User-Agent": "Week1Task19-MCP/0.1 (educational project; contact: example@example.com)"}
 
 db = Database()
 app_context = AppContext(db)
@@ -637,6 +639,8 @@ def search(
                 "action": "query",
                 "prop": "extracts",
                 "explaintext": 1,
+                "exintro": 1,
+                "exlimit": "max",
                 "titles": "|".join(titles),
                 "format": "json",
             },
