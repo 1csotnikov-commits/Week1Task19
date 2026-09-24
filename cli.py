@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import shlex
 import sys
 import threading
 from typing import Any
@@ -56,13 +55,25 @@ def print_help() -> None:
 def split_args(text: str) -> list[str]:
     """Разбивает строку на аргументы, поддерживая двойные кавычки.
 
-    ``posix=False`` сохраняет обратные слэши (важно для Windows-путей).
+    Кавычки группируют значения с пробелами (``query="значение с пробелом"``),
+    а обратные слэши сохраняются (важно для Windows-путей) — в отличие от
+    ``shlex.split(posix=True)``, который трактует ``\\`` как escape.
     """
-    try:
-        return shlex.split(text, posix=False)
-    except ValueError:
-        # Незакрытая кавычка — возвращаем грубое разбиение по пробелам.
-        return text.split()
+    tokens: list[str] = []
+    current: list[str] = []
+    in_quotes = False
+    for ch in text:
+        if ch == '"':
+            in_quotes = not in_quotes
+        elif ch.isspace() and not in_quotes:
+            if current:
+                tokens.append("".join(current))
+                current = []
+        else:
+            current.append(ch)
+    if current:
+        tokens.append("".join(current))
+    return tokens
 
 
 def _coerce_value(value: str, schema: dict[str, Any]) -> Any:
