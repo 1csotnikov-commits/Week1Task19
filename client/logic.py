@@ -109,6 +109,23 @@ class MCPApp:
         self._last_call_time = time.time()
         return format_call_result(result)
 
+    async def call_tool_raw(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+        """Вызывает инструмент и возвращает сырой результат (dict/list/str).
+
+        Используется движком пайплайнов, которому нужны структурированные
+        выходы шагов (а не отформатированный текст).
+        """
+        result = await self._session.call_tool(name, arguments)
+        self._last_call_time = time.time()
+        if result.is_error:
+            raise RuntimeError(format_call_result(result))
+        if result.structured_content is not None:
+            data = result.structured_content
+            if isinstance(data, dict) and set(data.keys()) == {"result"}:
+                data = data["result"]
+            return data
+        return _content_to_text(result)
+
     async def get_weather(self, city: str, days: int | None = None, units: str = "metric") -> str:
         """Вызывает погодный инструмент (текущая погода или прогноз) и возвращает текст.
 

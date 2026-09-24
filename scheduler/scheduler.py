@@ -12,7 +12,7 @@ from datetime import timedelta
 from typing import Any
 
 from scheduler.db import Database, now_iso, now_utc, parse_dt
-from scheduler.jobs import execute_job
+from scheduler.jobs import execute_job, run_pipeline_job
 
 logger = logging.getLogger("scheduler")
 
@@ -22,9 +22,10 @@ TICK_SECONDS = 20
 class Scheduler:
     """Периодически выполняет задачи, у которых наступило время запуска."""
 
-    def __init__(self, db: Database, app_context: Any) -> None:
+    def __init__(self, db: Database, app_context: Any, tool_caller: Any = None) -> None:
         self.db = db
         self.app_context = app_context
+        self.tool_caller = tool_caller
         self._task: asyncio.Task | None = None
 
     def start(self) -> None:
@@ -96,9 +97,12 @@ class Scheduler:
         now = now_iso()
 
         try:
-            payload = await asyncio.to_thread(execute_job, s)
+            if type_ == "pipeline":
+                payload = await run_pipeline_job(s, self.tool_caller)
+            else:
+                payload = await asyncio.to_thread(execute_job, s)
             status = "success"
-            event_type = "reminder_fired" if type_ == "reminder" else "collection_done"
+            event_type = _success_event_type(type_)
             description = _success_description(type_, payload)
         except Exception as exc:  # noqa: BLE001
             status = "error"
@@ -110,8 +114,8 @@ class Scheduler:
         await asyncio.to_thread(self.db.set_last_run, schedule_id, now)
 
         interval = s.get("interval_seconds")
-        if type_ == "reminder" and not interval:
-            # Разовое напоминание → терминальное состояние.
+        if not interval:
+            # Разовое напоминание/пайплайн → терминальное состояние.
             await asyncio.to_thread(self.db.set_status, schedule_id, "completed")
         else:
             # Периодическая задача: следующий запуск через интервал.
@@ -121,7 +125,17 @@ class Scheduler:
         await self.app_context.emit(event_type, description, schedule_id)
 
 
+def _success_event_type(type_: str) -> str:
+    if type_ == "pipeline":
+        return "pipeline_done"
+    if type_ == "reminder":
+        return "reminder_fired"
+    return "collection_done"
+
+
 def _success_description(type_: str, payload: dict[str, Any]) -> str:
     if type_ == "reminder":
         return payload.get("text", "")
+    if type_ == "pipeline":
+        return f"пайплайн {payload.get('pipeline_name', '?')} завершён"
     return f"собрана погода для {payload.get('city', '?')}"

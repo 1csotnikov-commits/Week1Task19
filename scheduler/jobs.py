@@ -1,4 +1,4 @@
-"""Логика выполнения задач: ``reminder`` и ``weather_collection``."""
+"""Логика выполнения задач: ``reminder``, ``weather_collection`` и ``pipeline``."""
 
 from __future__ import annotations
 
@@ -85,3 +85,29 @@ def execute_job(schedule: dict[str, Any]) -> dict[str, Any]:
     if type_ == "weather_collection":
         return run_weather_collection(schedule)
     raise JobError(f"Неизвестный тип задачи: {type_}")
+
+
+async def run_pipeline_job(schedule: dict[str, Any], tool_caller: Any) -> dict[str, Any]:
+    """Выполняет пайплайн-задачу и возвращает payload (путь к файлу + summary)."""
+    from pipelines.engine import load_pipelines, run_pipeline
+    from pipelines.errors import PipelineError
+
+    if tool_caller is None:
+        raise PipelineError("tool_caller не настроен — пайплайн выполнить нельзя.")
+
+    params = schedule.get("params") or {}
+    name = params.get("pipeline_name", "")
+    args = params.get("args", {})
+    pipelines = load_pipelines()
+    if name not in pipelines:
+        raise JobError(f"Пайплайн '{name}' не найден.")
+
+    result, steps_log = await run_pipeline(pipelines[name], args, tool_caller)
+
+    payload: dict[str, Any] = {"pipeline_name": name, "result": result}
+    if isinstance(result, dict) and "path" in result:
+        payload["path"] = result["path"]
+    for step in steps_log:
+        if step["tool"] == "summarize":
+            payload["summary"] = step["output"]
+    return payload

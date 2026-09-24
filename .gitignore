@@ -13,6 +13,9 @@ env/
 scheduler.db
 *.db
 
+# Отчёты, создаваемые пайплайнами
+reports/
+
 .idea/
 .vscode/
 

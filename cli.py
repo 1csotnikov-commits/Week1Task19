@@ -22,6 +22,7 @@ from client.logic import (
     format_status,
     format_tools,
 )
+from pipelines.errors import PipelineError, PipelineStepError
 
 #: Единый источник описаний команд CLI. Добавление новой команды сюда
 #: автоматически отражается в выводе ``/help``.
@@ -31,9 +32,10 @@ COMMANDS: dict[str, str] = {
     "/call": "вызвать инструмент MCP вручную (например: /call git_status или /call git_log limit=5)",
     "/weather": "показать погоду: /weather <city> [--days N] [--units metric|imperial]",
     "/ask-weather": "спросить агента о погоде: /ask-weather <city> [вопрос] (через LLM)",
-    "/schedule": "управление задачами: /schedule list|reminder|weather|cancel|pause|resume ...",
+    "/schedule": "управление задачами: /schedule list|reminder|weather|pipeline|cancel|pause|resume ...",
     "/summary": "сводка по собранной погоде: /summary <city>|--all|--reminders [--days N]",
     "/schedules": "события планировщика: /schedules events [--since <ISO>]",
+    "/pipeline": "пайплайны: /pipeline run|list|show|reload ...",
     "/status": "показать состояние MCP-соединения: подключение, имя сервера, версию протокола, инструменты, время последнего вызова",
     "/reconnect": "переустановить MCP-соединение: закрыть сессию, перезапустить сервер, initialize и заново получить инструменты",
     "/exit": "выйти из программы с корректным закрытием MCP-соединения (синоним: /quit)",
@@ -325,6 +327,8 @@ async def handle_schedule(app: MCPApp, tokens: list[str]) -> None:
         await _handle_schedule_reminder(app, rest)
     elif sub == "weather":
         await _handle_schedule_weather(app, rest)
+    elif sub == "pipeline":
+        await _handle_schedule_pipeline(app, rest)
     elif sub in ("cancel", "pause", "resume"):
         await _handle_schedule_status(app, sub, rest)
     else:
@@ -419,6 +423,214 @@ async def handle_schedules_events(app: MCPApp, tokens: list[str]) -> None:
     await _call_and_print(app, "get_due_results", args)
 
 
+async def _client_tool_caller(app: MCPApp, name: str, arguments: dict[str, Any]) -> Any:
+    """Вызывает MCP-инструмент через клиент и возвращает сырой результат."""
+    result = await app.call_tool_raw(name, arguments)
+    if isinstance(result, dict) and "error" in result:
+        raise PipelineError(str(result["error"]))
+    return result
+
+
+def _pipeline_debug(info: dict[str, Any]) -> None:
+    """Печатает информацию о шаге пайплайна (отладочный режим)."""
+    if info["phase"] == "start":
+        print(f"[шаг] {info['step']} (инструмент {info['tool']})")
+        print(f"  вход: {json.dumps(info['input'], ensure_ascii=False, default=str)}")
+    else:
+        out = info["output"]
+        if isinstance(out, str):
+            size = len(out)
+            preview = out[:120]
+            typ = "str"
+        else:
+            s = json.dumps(out, ensure_ascii=False, default=str)
+            size = len(s)
+            preview = s[:120]
+            typ = type(out).__name__
+        print(f"  выход: тип={typ}, размер={size}, первые символы: {preview}")
+
+
+async def handle_pipeline(app: MCPApp, tokens: list[str]) -> None:
+    """Обрабатывает команду ``/pipeline <run|list|show|reload> ...``."""
+    if not tokens:
+        print("Использование: /pipeline run|list|show|reload ...")
+        return
+    sub = tokens[0].lower()
+    rest = tokens[1:]
+    if sub == "run":
+        await _pipeline_run(app, rest)
+    elif sub == "list":
+        await _pipeline_list()
+    elif sub == "show":
+        await _pipeline_show(rest)
+    elif sub == "reload":
+        await _pipeline_reload()
+    else:
+        print(f"Неизвестная подкоманда /pipeline: {sub}. Введите /help.")
+
+
+async def _pipeline_run(app: MCPApp, tokens: list[str]) -> None:
+    """Обрабатывает ``/pipeline run <name> [key=value ...] [--debug]``."""
+    name: str | None = None
+    args: dict[str, Any] = {}
+    debug = False
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "--debug":
+            debug = True
+            i += 1
+        elif "=" in tok:
+            k, v = tok.split("=", 1)
+            args[k.strip()] = v.strip()
+            i += 1
+        elif name is None:
+            name = tok
+            i += 1
+        else:
+            print(f"Неизвестный аргумент: {tok}")
+            return
+    if not name:
+        print("Использование: /pipeline run <name> [key=value ...] [--debug]")
+        return
+
+    from pipelines.engine import load_pipelines, run_pipeline
+
+    try:
+        pipelines = load_pipelines()
+    except PipelineError as exc:
+        print(f"Ошибка: {exc}")
+        return
+    pipeline = pipelines.get(name)
+    if pipeline is None:
+        print(f"Пайплайн '{name}' не найден. Используйте /pipeline list.")
+        return
+
+    debug_cb = _pipeline_debug if debug else None
+
+    try:
+        result, _ = await run_pipeline(pipeline, args, lambda n, a: _client_tool_caller(app, n, a), debug_cb)
+    except PipelineStepError as exc:
+        print(f"Пайплайн прерван на шаге '{exc.step_name}'")
+        print(f"Инструмент: {exc.tool_name}")
+        print(f"Ошибка: {exc.message}")
+        if exc.steps_log:
+            print("Промежуточные результаты:")
+            for s in exc.steps_log:
+                out = s["output"]
+                preview = out if isinstance(out, str) else json.dumps(out, ensure_ascii=False, default=str)
+                print(f"  - {s['step']}: {preview[:200]}")
+        return
+    except PipelineError as exc:
+        print(f"Ошибка пайплайна: {exc}")
+        return
+
+    print("=== Результат пайплайна ===")
+    if isinstance(result, str):
+        print(result)
+    else:
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+
+
+async def _pipeline_list() -> None:
+    """Обрабатывает ``/pipeline list``."""
+    from pipelines.engine import load_pipelines
+
+    try:
+        pipelines = load_pipelines()
+    except PipelineError as exc:
+        print(f"Ошибка: {exc}")
+        return
+    if not pipelines:
+        print("Пайплайны не определены.")
+        return
+    print("Доступные пайплайны:")
+    for pname, p in pipelines.items():
+        print(f"  {pname} — {p.get('description', '')}")
+
+
+async def _pipeline_show(tokens: list[str]) -> None:
+    """Обрабатывает ``/pipeline show <name>``."""
+    if not tokens:
+        print("Использование: /pipeline show <name>")
+        return
+    name = tokens[0]
+    from pipelines.engine import load_pipelines
+
+    try:
+        pipelines = load_pipelines()
+    except PipelineError as exc:
+        print(f"Ошибка: {exc}")
+        return
+    pipeline = pipelines.get(name)
+    if pipeline is None:
+        print(f"Пайплайн '{name}' не найден.")
+        return
+    print(f"Пайплайн: {name}")
+    print(f"Описание: {pipeline.get('description', '')}")
+    print("Шаги:")
+    for step in pipeline.get("steps", []):
+        print(f"  - {step.get('name')} (инструмент {step.get('tool')})")
+        print(f"      вход: {json.dumps(step.get('input', {}), ensure_ascii=False)}")
+
+
+async def _pipeline_reload() -> None:
+    """Обрабатывает ``/pipeline reload``."""
+    from pipelines.engine import load_pipelines
+
+    try:
+        pipelines = load_pipelines()
+    except PipelineError as exc:
+        print(f"Ошибка: {exc}")
+        return
+    print(f"Конфигурация пайплайнов перечитана ({len(pipelines)} шт.).")
+
+
+async def _handle_schedule_pipeline(app: MCPApp, tokens: list[str]) -> None:
+    """Обрабатывает ``/schedule pipeline <name> [key=value ...] --every N | --in N``."""
+    name: str | None = None
+    args: dict[str, Any] = {}
+    every: int | None = None
+    in_minutes: int | None = None
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "--every":
+            if i + 1 >= len(tokens):
+                print("--every требует значение (минуты)")
+                return
+            every = _parse_int(tokens[i + 1], "--every")
+            i += 2
+        elif tok == "--in":
+            if i + 1 >= len(tokens):
+                print("--in требует значение (минуты)")
+                return
+            in_minutes = _parse_int(tokens[i + 1], "--in")
+            i += 2
+        elif "=" in tok:
+            k, v = tok.split("=", 1)
+            args[k.strip()] = v.strip()
+            i += 1
+        elif name is None:
+            name = tok
+            i += 1
+        else:
+            print(f"Неизвестный аргумент: {tok}")
+            return
+    if not name:
+        print("Использование: /schedule pipeline <name> [key=value ...] --every <N> | --in <N>")
+        return
+    if every is None and in_minutes is None:
+        print("Укажите --every <N> (периодически) или --in <N> (разово).")
+        return
+    tool_args: dict[str, Any] = {"pipeline_name": name, "args": args}
+    if every is not None:
+        tool_args["interval_minutes"] = every
+    if in_minutes is not None:
+        tool_args["in_minutes"] = in_minutes
+    await _call_and_print(app, "schedule_pipeline", tool_args)
+
+
 async def run_once(app: MCPApp) -> None:
     """Одноразовый режим: подключиться, вывести инструменты и результат git_status, выйти."""
     await app.connect()
@@ -504,6 +716,8 @@ async def run_interactive(app: MCPApp) -> None:
                 await handle_summary(app, tokens[1:])
             elif command == "/schedules":
                 await handle_schedules_events(app, tokens[1:])
+            elif command == "/pipeline":
+                await handle_pipeline(app, tokens[1:])
             elif command == "/status":
                 print(format_status(await app.status()))
             elif command == "/reconnect":

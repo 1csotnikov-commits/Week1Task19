@@ -19,6 +19,10 @@
   "scheduler": {
     "db_path": "scheduler.db",
     "db_path_env": "SCHEDULER_DB_PATH"
+  },
+  "pipelines": {
+    "config_file": "pipelines.json",
+    "reports_dir": "reports"
   }
 }
 

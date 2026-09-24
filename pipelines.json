@@ -1,0 +1,24 @@
+{
+  "pipelines": {
+    "research": {
+      "description": "Поиск в Wikipedia, сжатие и сохранение в файл",
+      "steps": [
+        {
+          "name": "search",
+          "tool": "search",
+          "input": { "query": "{{args.query}}", "limit": 3 }
+        },
+        {
+          "name": "summary",
+          "tool": "summarize",
+          "input": { "text": "{{steps.search.output.results[0].extract}}", "max_length": 400 }
+        },
+        {
+          "name": "save",
+          "tool": "saveToFile",
+          "input": { "content": "{{steps.summary.output}}", "format": "md" }
+        }
+      ]
+    }
+  }
+}

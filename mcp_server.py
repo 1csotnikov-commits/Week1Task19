@@ -11,6 +11,7 @@ stdin/stdout. Поэтому здесь запрещено писать что-�
 
 from __future__ import annotations
 
+import asyncio
 import httpx
 import logging
 import os
@@ -19,7 +20,9 @@ import subprocess
 import sys
 from contextlib import asynccontextmanager
 from datetime import timedelta
+from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import quote
 
 from mcp.server.mcpserver import MCPServer
 from pydantic import Field
@@ -258,6 +261,11 @@ def _format_forecast(city_display: str, daily: dict[str, Any], units: str) -> st
 
 # --- Планировщик (псевдо-24/7) ---
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+#: User-Agent для запросов к Wikipedia (иначе API возвращает 403).
+WIKIPEDIA_HEADERS = {"User-Agent": "Week1Task19-MCP/0.1 (educational project)"}
+
 db = Database()
 app_context = AppContext(db)
 
@@ -268,10 +276,23 @@ async def _capture_session_middleware(ctx, call_next):
     return await call_next(ctx)
 
 
+async def _server_tool_caller(name: str, arguments: dict[str, Any]) -> Any:
+    """Вызывает инструмент сервера по имени (используется движком пайплайнов)."""
+    from pipelines.errors import PipelineError
+
+    tool = server._tool_manager._tools.get(name)
+    if tool is None:
+        raise PipelineError(f"Инструмент '{name}' не найден на сервере.")
+    result = await asyncio.to_thread(tool.fn, **arguments)
+    if isinstance(result, dict) and "error" in result:
+        raise PipelineError(str(result["error"]))
+    return result
+
+
 @asynccontextmanager
 async def _lifespan(app):
     """Запускает фоновый планировщик на время жизни сервера."""
-    scheduler = Scheduler(db, app_context)
+    scheduler = Scheduler(db, app_context, tool_caller=_server_tool_caller)
     scheduler.start()
     try:
         yield app_context
@@ -580,6 +601,157 @@ def get_due_results(
         events = db.list_events(acknowledged=0, since=since or None)
         db.acknowledge_events([e["id"] for e in events])
         return {"results": results, "events": events}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+
+
+@server.tool()
+def search(
+    query: Annotated[str, Field(description="Поисковый запрос")],
+    limit: Annotated[int, Field(description="Сколько результатов вернуть (максимум 5)")] = 1,
+    language: Annotated[str, Field(description="Язык Wikipedia (например, ru, en)")] = "ru",
+) -> dict[str, Any]:
+    """Ищет страницы в Wikipedia и возвращает краткое содержимое лучших статей."""
+    try:
+        if not query or not query.strip():
+            return {"error": "Некорректный параметр: query не может быть пустым."}
+        if limit < 1 or limit > 5:
+            return {"error": "Некорректный параметр: limit должен быть от 1 до 5."}
+
+        api = f"https://{language}.wikipedia.org/w/api.php"
+        search_resp = httpx.get(
+            api,
+            params={"action": "query", "list": "search", "srsearch": query.strip(), "srlimit": limit, "format": "json"},
+            headers=WIKIPEDIA_HEADERS,
+            timeout=15.0,
+        )
+        search_resp.raise_for_status()
+        found = search_resp.json().get("query", {}).get("search", [])
+        if not found:
+            return {"results": [], "message": f"По запросу «{query.strip()}» ничего не найдено."}
+
+        titles = [r["title"] for r in found]
+        extract_resp = httpx.get(
+            api,
+            params={
+                "action": "query",
+                "prop": "extracts",
+                "explaintext": 1,
+                "titles": "|".join(titles),
+                "format": "json",
+            },
+            headers=WIKIPEDIA_HEADERS,
+            timeout=15.0,
+        )
+        extract_resp.raise_for_status()
+        pages = extract_resp.json().get("query", {}).get("pages", {})
+        by_title = {p.get("title"): p.get("extract", "") for p in pages.values()}
+
+        results = []
+        for r in found:
+            title = r["title"]
+            results.append(
+                {
+                    "title": title,
+                    "extract": by_title.get(title, ""),
+                    "url": f"https://{language}.wikipedia.org/wiki/{quote(title.replace(' ', '_'))}",
+                }
+            )
+        return {"results": results}
+    except httpx.HTTPStatusError as exc:
+        return {"error": f"Wikipedia вернул ошибку HTTP {exc.response.status_code}"}
+    except httpx.RequestError as exc:
+        return {"error": f"Не удалось обратиться к Wikipedia: {exc}"}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"Непредвиденная ошибка: {exc}"}
+
+
+@server.tool(structured_output=False)
+def summarize(
+    text: Annotated[str, Field(description="Текст для сжатия")],
+    max_length: Annotated[int, Field(description="Примерная длина summary в символах")] = 500,
+    style: Annotated[str, Field(description="Стиль summary")] = "кратко и по делу",
+) -> Any:
+    """Сжимает текст через LLM (DeepSeek)."""
+    from llm.provider import LLMError, ask
+
+    try:
+        if not text or not text.strip():
+            return {"error": "Некорректный параметр: text не может быть пустым."}
+        prompt = (
+            f"Сожми следующий текст. Стиль: {style}. "
+            f"Примерная длина: {max_length} символов.\n\nТекст:\n{text}"
+        )
+        return ask(prompt)
+    except LLMError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"Непредвиденная ошибка: {exc}"}
+
+
+@server.tool(name="saveToFile")
+def save_to_file(
+    content: Annotated[str, Field(description="Что сохранить")],
+    path: Annotated[str | None, Field(description="Путь к файлу; если не задан — генерируется в reports/")] = None,
+    format: Annotated[str, Field(description="Расширение файла: md, txt, json")] = "md",
+) -> dict[str, Any]:
+    """Сохраняет содержимое в файл (только внутри корня проекта)."""
+    try:
+        if not content:
+            return {"error": "Некорректный параметр: content не может быть пустым."}
+        if format not in ("md", "txt", "json"):
+            return {"error": "Некорректный параметр: format должен быть md, txt или json."}
+
+        if path:
+            target = Path(path)
+            if not target.is_absolute():
+                target = PROJECT_ROOT / target
+            resolved = target.resolve()
+            if not resolved.is_relative_to(PROJECT_ROOT.resolve()):
+                return {"error": "Некорректный параметр: запрещено записывать файлы вне корня проекта."}
+        else:
+            timestamp = now_utc().strftime("%Y%m%d_%H%M%S")
+            reports_dir = PROJECT_ROOT / "reports"
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            target = reports_dir / f"report_{timestamp}.{format}"
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return {"path": str(target.resolve()), "size_bytes": target.stat().st_size}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+
+
+@server.tool()
+def schedule_pipeline(
+    pipeline_name: Annotated[str, Field(description="Имя пайплайна из pipelines.json")],
+    args: Annotated[dict[str, Any], Field(description="Аргументы пайплайна (JSON-объект)")],
+    interval_minutes: Annotated[int | None, Field(description="Период запуска в минутах (для периодического)")] = None,
+    in_minutes: Annotated[int | None, Field(description="Через сколько минут запустить (для разового)")] = None,
+) -> dict[str, Any]:
+    """Создаёт задачу запуска пайплайна (разовую или периодическую)."""
+    try:
+        if not pipeline_name or not pipeline_name.strip():
+            return {"error": "Некорректный параметр: pipeline_name не может быть пустым."}
+        if interval_minutes is not None and in_minutes is not None:
+            return {"error": "Некорректный параметр: укажите либо interval_minutes, либо in_minutes."}
+        if interval_minutes is not None and interval_minutes < 1:
+            return {"error": "Некорректный параметр: interval_minutes должен быть не меньше 1."}
+        if in_minutes is not None and in_minutes <= 0:
+            return {"error": "Некорректный параметр: in_minutes должен быть положительным."}
+
+        if in_minutes is not None:
+            next_run = (now_utc() + timedelta(minutes=in_minutes)).isoformat()
+        else:
+            next_run = now_iso()
+
+        schedule_id = db.create_schedule(
+            "pipeline",
+            {"pipeline_name": pipeline_name.strip(), "args": args or {}},
+            next_run_at=next_run,
+            interval_seconds=interval_minutes * 60 if interval_minutes else None,
+        )
+        return {"id": schedule_id, "next_run_at": next_run}
     except Exception as exc:  # noqa: BLE001
         return {"error": str(exc)}
 
